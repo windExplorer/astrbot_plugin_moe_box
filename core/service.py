@@ -695,6 +695,10 @@ class BoxService:
         fallback_id = self._norm_provider_id(models.fallback)
 
         primary = self._resolve_llm(site_key)
+        logger.info(
+            f"[资料卡] AI 诊断｜[{site_key}] 配置所选={chosen_id or '(未选)'}、"
+            f"兜底={fallback_id or '(未选)'}、解析到={self._provider_label(primary)}"
+        )
         if self._provider_supports_image(primary):
             return primary
 
@@ -916,6 +920,15 @@ class BoxService:
         "没有提供图片",
         "未提供图片",
         "图片不可用",
+        # 模型看不到图时，常把提示词里的兜底句原样复述出来（用户截图里那句）。
+        # 这些同样是「没真看到内容」，不该印到卡片上冒充点评。
+        "看不到头像",
+        "无法根据画面",
+        "无法查看图片",
+        "无法识别图片",
+        "不能用图片",
+        "请只写",
+        "请只输出",
     )
 
     @classmethod
@@ -924,6 +937,27 @@ class BoxService:
         if not text:
             return True
         return any(hint in text for hint in cls._AI_NOTHING_SEE_HINTS)
+
+    @staticmethod
+    def _provider_label(provider: Any) -> str:
+        """日志里用的模型身份串：提供商 ID / 模型名 / 声明的模态，一眼看清在用什么。"""
+        if provider is None:
+            return "<无>"
+        meta = {}
+        try:
+            m = provider.meta()
+            if isinstance(m, dict):
+                meta = m
+        except Exception:
+            pass
+        pid = meta.get("id") or getattr(provider, "provider_id", "") or ""
+        model = (getattr(provider, "model_name", "") or meta.get("model", "") or "")
+        try:
+            modalities = (getattr(provider, "provider_config", None) or {}).get("modalities")
+        except Exception:
+            modalities = None
+        mod = ",".join(str(x) for x in modalities) if modalities else "未声明(按全支持)"
+        return f"{pid or '<unknown>'}/{model or '<unknown>'} [modalities={mod}]"
 
     async def _get_analyses(
         self,
@@ -1002,26 +1036,54 @@ class BoxService:
                   f"{name_hint}", True))
             )
         if not specs:
+            logger.info(
+                "[资料卡] AI 诊断｜本次没有任何分析任务：头像分析="
+                f"{ai.avatar_analysis}（头像可用={avatar_ok}）、签名分析={ai.signature_analysis}"
+                f"（有签名={bool(signature)}）、综合锐评={ai.overall_analysis}、卡类型={card_type or '普通查询'}"
+            )
             return {}
+
+        # 一次性汇总日志：把「用哪个模型、是否识图、头像怎么传」摊开，排查「看不到头像」必备。
+        # 带图项的 provider 是 _resolve_vision_llm 选出来的（已含识图回退结果）。
+        if avatar_bytes:
+            img_desc = f"已下载字节 {len(avatar_bytes)}B → base64:// 内嵌"
+        else:
+            img_desc = "无字节 → 回退外链 https://q4.qlogo.cn/...（境外模型可能拉不到）"
+        logger.info(
+            f"[资料卡] AI 诊断｜头像传入方式：{img_desc}；头像可用={avatar_ok}；"
+            f"本次启用 {len(specs)} 项分析"
+        )
+        for key, provider, (_prompt, with_image) in specs:
+            logger.info(
+                f"[资料卡] AI 诊断｜[{key}] 模型={self._provider_label(provider)}；"
+                f"带图={with_image}；识图能力声明="
+                f"{'支持' if self._provider_supports_image(provider) else '不支持（该模型看不懂图）'}"
+            )
 
         async def _run(key: str, provider: Any, prompt_info: tuple[str, bool]) -> tuple[str, str]:
             prompt, with_image = prompt_info
             if not provider:
+                logger.info(f"[资料卡] AI 诊断｜[{key}] 无可用模型，跳过")
                 return key, ""
             try:
                 response = await provider.text_chat(
                     prompt=prompt,
                     image_urls=[avatar_url] if with_image else None,
                 )
-                text = (response.completion_text or "").strip()[:80]
+                raw = (response.completion_text or "").strip()
+                text = raw[:80]
+                logger.info(
+                    f"[资料卡] AI 诊断｜[{key}] 原始返回（前120字）={raw[:120]!r}"
+                )
                 if self._is_empty_looking_analysis(text):
                     logger.info(
-                        f"[资料卡] AI {key} 返回的是「没看到内容」类提示，已丢弃：{text[:40]}"
+                        f"[资料卡] AI 诊断｜[{key}] 判定为「没看到内容」类，已丢弃；"
+                        f"若模型声明支持识图却仍这样，检查模型是否真能识别图片、或图片是否成功传入（见上方头像传入方式）"
                     )
                     return key, ""
                 return key, text
             except Exception as e:
-                logger.warning(f"llm analysis [{key}] failed: {e}")
+                logger.warning(f"[资料卡] AI 诊断｜[{key}] 调用失败: {type(e).__name__}: {e}")
                 return key, ""
 
         pairs = await asyncio.gather(*(_run(k, p, pi) for k, p, pi in specs))
