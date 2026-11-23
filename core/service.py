@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import random
@@ -14,7 +15,10 @@ from astrbot.api import logger
 from .config import PluginConfig
 from .draw import CardMaker
 from .profile import (
+    AVATAR_TIME_KEYS,
     BIRTHDAY_KEYS,
+    COLLEGE_KEYS,
+    EMAIL_KEYS,
     REG_TIME_KEYS,
     BoxUserProfile,
     flatten_info,
@@ -27,8 +31,10 @@ from .store import MemberStore
 # 新成员在此窗口内仍算在群；更早的记录视为幽灵（退群事件漏收），不计入总数。
 PRESENCE_GRACE_SECONDS = 3600
 
-# 注册时间/生日在 QQ 官方接口里都没有，只能指望适配器扩展字段；两者都拿不到时
-# 打一次字段清单（只打一次，别每次出卡都刷日志），方便用户确认适配器到底给了什么。
+# 注册时间/头像修改时间/生日等「时间档案」字段在 QQ 官方接口里都没有，只能指望
+# 适配器扩展字段。首次出卡打一次诊断清单（只打一次，别每次出卡都刷日志），明确列出
+# 命中了哪些时间字段的原始值、以及两个接口实际返回的全部字段名，方便用户一眼确认
+# 协议端（SnowLuma/NapCat/Lagrange 等）到底给不给这些字段。
 _PROFILE_SOURCE_HINTED = False
 
 
@@ -37,18 +43,54 @@ def _hint_missing_profile_source(stranger_info: dict, member_info: dict) -> None
     if _PROFILE_SOURCE_HINTED:
         return
     _PROFILE_SOURCE_HINTED = True
-    merged = flatten_info(stranger_info)
-    merged.update(flatten_info(member_info))
+
+    def _merged() -> dict:
+        out = flatten_info(stranger_info)
+        out.update(flatten_info(member_info))
+        return out
+
+    merged = _merged()
     keys = {str(k).lower() for k in merged}
-    if keys & {k.lower() for k in REG_TIME_KEYS} or keys & {k.lower() for k in BIRTHDAY_KEYS}:
-        return
-    logger.info(
-        "[资料卡] 本次 get_stranger_info/get_group_member_info 都没返回注册时间/生日字段，"
-        "卡片上的注册时间将按 QQ 号号段估算。这两项都只能靠适配器扩展字段：NapCat 与 SnowLuma "
-        "的 get_stranger_info 都定义了 reg_time，但拿不到时会**直接省略该字段**（非好友、对方"
-        "隐私设置、适配器版本较旧都会这样），所以下面清单里没有 reg_time 就说明这次真的没返回。"
-        f"本次实际返回字段：{sorted(merged.keys())}"
-    )
+
+    def _hits(aliases: tuple[str, ...]) -> dict[str, Any]:
+        """列出本次实际命中（大小写不敏感）的字段及其原始值。"""
+        return {
+            str(k): merged[k]
+            for k in merged
+            if str(k).lower() in {a.lower() for a in aliases}
+        }
+
+    reg_hits = _hits(REG_TIME_KEYS)
+    avatar_hits = _hits(AVATAR_TIME_KEYS)
+    birthday_hits = _hits(BIRTHDAY_KEYS)
+    email_hits = _hits(EMAIL_KEYS)
+    college_hits = _hits(COLLEGE_KEYS)
+
+    reg_ok = bool(reg_hits)
+    lines = [
+        "[资料卡] 时间档案字段诊断（首次出卡打印一次）：",
+        f"  注册时间字段命中：{reg_hits if reg_ok else '无'}",
+        f"  头像修改时间字段命中：{avatar_hits if avatar_hits else '无'}",
+        f"  生日字段命中：{birthday_hits if birthday_hits else '无'}",
+        f"  邮箱字段命中：{email_hits if email_hits else '无'}",
+        f"  学校字段命中：{college_hits if college_hits else '无'}",
+    ]
+    if reg_ok:
+        lines.append(
+            "  注册时间已拿到扩展字段：秒级数字时间戳会显示到时分秒并算注册天数；"
+            "日期文本只显示年份。"
+        )
+    else:
+        lines.extend(
+            [
+                "  注册时间没拿到任何扩展字段，卡片按 QQ 号号段估算。注意：QQ 官方无注册时间接口，",
+                "  OneBot V11 的 get_stranger_info 也不含该字段——只有协议端私有扩展会给。NapCat/",
+                "  SnowLuma 定义了 reg_time 但拿不到时直接省略（非好友/隐私设置/版本较旧都会这样），",
+                "  想拿真值只能靠协议端自己扩展返回，或换支持 OIDB 的协议（如 ICQQ）。",
+            ]
+        )
+    lines.append(f"  本次接口返回的全部字段：{sorted(merged.keys())}")
+    logger.info("\n".join(lines))
 
 # 新朋友卡（入群卡）固定补充显示的字段：新人的第一印象卡，就算「信息显示选项」里
 # 没勾也一并展示；字段本身没数据时不会占行（_format_field 会跳过空值）。
@@ -384,6 +426,7 @@ class BoxService:
             card_type,
             avatar_ok=bool(result.avatar_bytes),
             nickname_missing=nickname_missing,
+            avatar_bytes=result.avatar_bytes,
         )
         if card_type == "join" and self.cfg.welcome_enabled:
             result.welcome_text = await self._build_welcome(result)
@@ -800,6 +843,7 @@ class BoxService:
         card_type: str = "",
         avatar_ok: bool = True,
         nickname_missing: bool = False,
+        avatar_bytes: bytes | None = None,
     ) -> dict[str, str]:
         """Run the enabled AI analyses (avatar / signature / overall) concurrently.
 
@@ -807,12 +851,21 @@ class BoxService:
         让模型对着空白硬编只会产出「无法查看图片」这类废话。``nickname_missing``
         用来给提示词加一句「对方没设昵称」，免得模型因为看不到昵称就回一句
         「资料不足，无法判断」。
+
+        头像图片一律走 ``avatar_bytes``（插件已用 aiohttp 下好的字节）转成
+        AstrBot 原生的 ``base64://`` 引用传给模型，不再把 qlogo 外链交给模型
+        二次下载：很多用户配的是 OpenAI/Gemini 等境外模型，其服务器拉取
+        qlogo.cn/headimg_dl 这类国内域名极易超时或被拒，表现就是「AI 看不到头像」。
+        ``avatar_bytes`` 缺失时回退到外链（兼容缓存命中等非首次出卡的路径）。
         """
         ai = self.cfg.ai_analysis
         # 退群/被踢卡默认不调用 LLM，除非显式开启 event_analysis
         if card_type in ("leave", "kick") and not ai.event_analysis:
             return {}
-        avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={target_id}&spec=640"
+        if avatar_bytes:
+            avatar_url = "base64://" + base64.b64encode(avatar_bytes).decode("ascii")
+        else:
+            avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={target_id}&spec=640"
         signature = (profile.long_nick or "").strip()
         profile_text = "\n".join(display)
         name_hint = (

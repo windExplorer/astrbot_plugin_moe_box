@@ -115,7 +115,19 @@ FIELD_MAPPING: list[dict[str, Any]] = [
     {
         "key": "reg_time",
         "label": "注册时间",
-        # 真值来自适配器扩展字段；拿不到时按 QQ 号号段估算（见 BoxUserProfile.reg_time_text）
+        # 真值来自适配器扩展字段（秒级时间戳显示到时分秒）；拿不到时按 QQ 号号段估算
+        "source": "computed",
+    },
+    {
+        "key": "reg_days",
+        "label": "注册天数",
+        # 仅有秒级注册时间真值时才算得出，否则整行省略
+        "source": "computed",
+    },
+    {
+        "key": "avatar_time",
+        "label": "头像修改时间",
+        # OneBot V11 标准无此字段，ICQQ/OIDB 扩展给了才显示
         "source": "computed",
     },
     {

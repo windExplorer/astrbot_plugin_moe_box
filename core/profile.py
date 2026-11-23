@@ -36,12 +36,22 @@ _QQ_ERA_LONG = (2009, 0)
 
 _YEAR_RE = re.compile(r"(1[6-9]\d{2}|20\d{2})")
 
-# 注册时间可能出现的字段名（适配器 / 第三方资料接口各不相同，逐个试）
+# 注册时间可能出现的字段名（适配器 / 第三方资料接口各不相同，逐个试）。
+# 包含 ICQQ/OIDB 生态（JiuLi 项目用的 regTimestamp/registrationTime）与常见
+# 驼峰/下划线写法：协议端只要给了其中任一个，就能显示秒级真值而非号段估算。
 REG_TIME_KEYS = (
     "reg_time",
     "regTime",
+    "regTimestamp",
+    "regtimestamp",
+    "reg_ts",
+    "regTs",
     "register_time",
     "registerTime",
+    "register_ts",
+    "registerTs",
+    "registration_time",
+    "registrationTime",
     "register_date",
     "registerDate",
     "reg_date",
@@ -50,6 +60,20 @@ REG_TIME_KEYS = (
     "createTime",
     "create_date",
     "createDate",
+    "created_at",
+    "createdAt",
+)
+
+# 头像修改时间字段名（ICQQ OIDB 0xfe1_2 字段 101 的 avatarTimestamp，及常见写法）。
+# OneBot V11 标准没有这个字段，适配器给了才显示，拿不到自动省略该行。
+AVATAR_TIME_KEYS = (
+    "avatarTimestamp",
+    "avatar_time",
+    "avatarTime",
+    "avatar_update_time",
+    "avatarUpdateTime",
+    "headImgUpdateTime",
+    "head_img_update_time",
 )
 
 # 生日可能出现的字段名
@@ -61,6 +85,21 @@ BIRTHDAY_KEYS = (
     "birthdate",
     "birth_date",
 )
+
+# 邮箱 / 学校 / QID 的字段别名。OneBot 用 eMail/college/qid，ICQQ 生态用
+# mail/school/QID，协议端给哪个都能进卡片对应行（JiuLi 项目里就是后一组）。
+EMAIL_KEYS = ("eMail", "email", "mail", "e_mail")
+COLLEGE_KEYS = ("college", "school", "university")
+QID_KEYS = ("qid", "QID", "qId")
+
+
+def _pick_first(source: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """按 keys 顺序取第一个非空值（字段别名兼容的统一入口）。"""
+    for key in keys:
+        value = source.get(key)
+        if value not in (None, "", "-", 0, "0"):
+            return value
+    return None
 
 # 适配器可能把资料包一层再返回（get_px 的 parse_qq_birthday 也做了同样的兼容）
 _NESTED_INFO_KEYS = (
@@ -142,6 +181,23 @@ def parse_epoch(value: Any) -> int:
         return int(datetime(int(matched.group(1)), 1, 1).timestamp())
     except (ValueError, OSError, OverflowError):
         return 0
+
+
+def reg_days_from(reg_time: Any, now: datetime | None = None) -> int | None:
+    """根据注册真值算「注册至今整天数」；无真值/时间非法返回 None。
+
+    只有适配器给了秒级注册时间戳时才算得出天数，估算的年份区间不算。
+    """
+    ts = parse_epoch(reg_time)
+    if not ts:
+        return None
+    try:
+        current = (now or datetime.now()).timestamp()
+        if current <= ts:
+            return None
+        return int((current - ts) // 86400)
+    except (OSError, ValueError, OverflowError):
+        return None
 
 
 def normalize_sex(value: Any) -> str:
@@ -342,6 +398,8 @@ class BoxUserProfile:
         "last_sent": "最后发言",
         "qqLevel": "QQ等级",
         "reg_time": "注册时间",
+        "reg_days": "注册天数",
+        "avatar_time": "头像修改时间",
         "login_days": "登录天数",
         "isHideQQLevel": "隐藏QQ等级",
         "isHidePrivilegeIcon": "特权图标",
@@ -393,6 +451,9 @@ class BoxUserProfile:
     last_sent: Any = None
     qq_level: Any = None
     reg_time: Any = None
+    reg_time_precise: bool = False
+    reg_days: Any = None
+    avatar_time: Any = None
     login_days: Any = None
     hide_qq_level: bool = False
     hide_privilege_icon: bool = False
@@ -444,10 +505,17 @@ class BoxUserProfile:
             # QQ 的年龄本来就是从生日算出来的；接口没给年龄时自己算
             age = age_from_birthday(birth_year, birth_month, birth_day) or None
 
+        # 注册时间真值：协议端给了秒级时间戳才算天数（估算年份区间不算）
+        reg_time, reg_time_precise = cls._pick_reg_time(stranger, member, library)
+        # 只有秒级真值才算天数；日期文本被 parse_epoch 补成年初，不算，避免假精度
+        reg_days = reg_days_from(reg_time) if reg_time_precise else None
+        # 头像修改时间：OneBot 标准无此字段，ICQQ/OIDB 扩展给了才显示
+        avatar_time = cls._pick_avatar_time(stranger, member, library)
+
         return cls(
             user_id=str(stranger.get("user_id") or ""),
             uid=str(stranger.get("uid") or ""),
-            qid=str(stranger.get("qid") or ""),
+            qid=str(_pick_first(stranger, QID_KEYS) or ""),
             nickname=str(stranger.get("nickname") or ""),
             remark=str(stranger.get("remark") or ""),
             card=str(member.get("card") or ""),
@@ -459,13 +527,13 @@ class BoxUserProfile:
             birthday_day=birth_day or None,
             age=age,
             blood_type=stranger.get("kBloodType"),
-            phone_number=str(stranger.get("phoneNum") or ""),
-            email=str(stranger.get("eMail") or ""),
+            phone_number=str(_pick_first(stranger, ("phoneNum", "phone_number", "mobile")) or ""),
+            email=str(_pick_first(stranger, EMAIL_KEYS) or ""),
             home_town=str(stranger.get("homeTown") or ""),
-            country=str(stranger.get("country") or ""),
+            country=str(_pick_first(stranger, ("country", "nation")) or ""),
             province=str(stranger.get("province") or ""),
             city=str(stranger.get("city") or ""),
-            college=str(stranger.get("college") or ""),
+            college=str(_pick_first(stranger, COLLEGE_KEYS) or ""),
             pos=str(stranger.get("pos") or ""),
             career=stranger.get("makeFriendCareer"),
             labels=stranger.get("labels"),
@@ -479,7 +547,10 @@ class BoxUserProfile:
             join_time=member.get("join_time"),
             last_sent=member.get("last_sent_time"),
             qq_level=cls._pick_qq_level(stranger),
-            reg_time=cls._pick_reg_time(stranger, member, library),
+            reg_time=reg_time,
+            reg_time_precise=reg_time_precise,
+            reg_days=reg_days,
+            avatar_time=avatar_time,
             login_days=stranger.get("login_days"),
             hide_qq_level=bool(stranger.get("isHideQQLevel")),
             hide_privilege_icon=bool(stranger.get("isHidePrivilegeIcon")),
@@ -515,16 +586,39 @@ class BoxUserProfile:
         return None
 
     @staticmethod
-    def _pick_reg_time(*sources: dict[str, Any]) -> int | None:
-        """注册时间：兼容秒/毫秒时间戳与日期文本，统一成 Unix 秒。
+    def _pick_reg_time(*sources: dict[str, Any]) -> tuple[int | None, bool]:
+        """注册时间：返回 ``(Unix 秒, 是否为秒级真值)``。
 
-        适配器（NapCat 等）与资料库接口的字段名不统一，逐个试；都没有则返回 None，
-        届时卡片上会退回「按 QQ 号号段估算」的显示（见 reg_time_text）。
+        适配器（NapCat / SnowLuma / ICQQ-OIDB 等）与资料库接口的字段名不统一，
+        逐个试。仅当原始值是**数字时间戳**（秒/毫秒）时 ``precise=True``，这时
+        卡片显示到时分秒、并可算注册天数；日期文本（如 ``2008-06-01``）只取年份，
+        标成 ``False``，避免把补出来的 1 月 1 日 0 点当真值显示。都没有则返回
+        ``(None, False)``，届时退回「按 QQ 号号段估算」（见 reg_time_text）。
         """
         for source in sources:
             if not isinstance(source, dict):
                 continue
             for key in REG_TIME_KEYS:
+                if key not in source:
+                    continue
+                raw = source.get(key)
+                if raw is None or raw == "":
+                    continue
+                text = str(raw).strip()
+                # 纯数字（含负号不需要）：秒级/毫秒级 unix 时间戳 = 真值
+                precise = text.isdigit()
+                ts = parse_epoch(raw)
+                if ts:
+                    return ts, precise
+        return None, False
+
+    @staticmethod
+    def _pick_avatar_time(*sources: dict[str, Any]) -> int | None:
+        """头像修改时间：兼容 ICQQ/OIDB 的 avatarTimestamp 等别名，统一成 Unix 秒。"""
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in AVATAR_TIME_KEYS:
                 if key not in source:
                     continue
                 ts = parse_epoch(source.get(key))
@@ -631,7 +725,10 @@ class BoxUserProfile:
             ts = parse_epoch(self.reg_time)
             if ts:
                 try:
-                    return datetime.fromtimestamp(ts).strftime("%Y年")
+                    # 秒级时间戳真值：显示到时分秒（用户要的「真实时间」）；
+                    # 日期文本补出来的 ts 只显示年份，绝不伪造月日时分秒。
+                    fmt = "%Y-%m-%d %H:%M:%S" if self.reg_time_precise else "%Y年"
+                    return datetime.fromtimestamp(ts).strftime(fmt)
                 except (ValueError, OSError, OverflowError):
                     pass
             matched = _YEAR_RE.search(str(self.reg_time))
@@ -799,6 +896,21 @@ class BoxUserProfile:
             case "reg_time":
                 text = self.reg_time_text
                 return [f"{label}：{text}"] if text else []
+            case "reg_days":
+                days = _to_int(self.reg_days)
+                if days and days > 0:
+                    return [f"{label}：{days}天（约 {days / 365.2425:.1f} 年）"]
+                return []
+            case "avatar_time":
+                if self.avatar_time is None:
+                    return []
+                ts = parse_epoch(self.avatar_time)
+                if not ts:
+                    return []
+                try:
+                    return [f"{label}：{datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}"]
+                except (ValueError, OSError, OverflowError):
+                    return []
             case "login_days":
                 try:
                     days = int(self.login_days)
