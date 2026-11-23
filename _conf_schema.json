@@ -247,7 +247,7 @@
             "avatar": {
                 "description": "头像分析提供商",
                 "type": "string",
-                "hint": "从已加载的对话提供商中选择；留空逐级回落",
+                "hint": "头像分析必须选支持识图的视觉模型（该提供商的「模型能力」勾选了「图像」，如 Gemini / GPT-4o / Qwen-VL）。若这里选了纯文本模型，插件会自动尝试回退到 AstrBot 全局配置的「图片转述模型」（provider_settings.default_image_caption_provider_id）；都没有就跳过头像点评，避免出现「没设置头像」的误判。留空逐级回落",
                 "default": "",
                 "_special": "select_provider"
             },
@@ -261,7 +261,7 @@
             "overall": {
                 "description": "综合锐评提供商",
                 "type": "string",
-                "hint": "从已加载的对话提供商中选择；留空逐级回落",
+                "hint": "综合锐评会同时看头像和资料，需选支持识图的视觉模型（「模型能力」勾选了「图像」）。不识图时自动回退 AstrBot 图片转述模型，都没有则跳过带图部分；留空逐级回落",
                 "default": "",
                 "_special": "select_provider"
             }

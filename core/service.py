@@ -653,6 +653,92 @@ class BoxService:
         logger.warning(f"[资料卡] 未找到 LLM 提供商 {provider_id}，回退系统默认")
         return context.get_using_provider()
 
+    @staticmethod
+    def _provider_supports_image(provider: Any) -> bool:
+        """判断一个 provider 声明的输入模态是否包含图像。
+
+        AstrBot 4.29+ 用 provider_config["modalities"] 表达能力（选项 text/image/
+        audio/tool_use）。空列表 / 缺字段是历史兼容写法，表示「未限制、默认全支持」，
+        只有非空且不含 image 才算明确不支持识图（与 AstrBot 的 supports_modality 同语义）。
+        """
+        if provider is None:
+            return False
+        try:
+            modalities = (getattr(provider, "provider_config", None) or {}).get("modalities")
+        except Exception:
+            return True  # 拿不到能力声明时按老行为放行，别把能用的模型误判成不识图
+        if not modalities:  # None / [] → 未配置，向后兼容按全支持
+            return True
+        if not isinstance(modalities, (list, tuple, set)):
+            return True
+        return "image" in modalities
+
+    def _resolve_vision_llm(self, site_key: str):
+        """为带图分析（头像/综合锐评）挑一个**支持识图**的 provider。
+
+        用户常见问题：头像分析选了纯文本模型（如只勾了 text 的 deepseek-chat），
+        插件直接调 provider.text_chat(image_urls=...) 绕过了 AstrBot runner 的模态拦截，
+        模型拿到图片占位符看不懂，只会套提示词里的兜底——「这位朋友还没设置头像呢」。
+
+        选择顺序：
+          1. 该功能自选的提供商若能识图 → 用它；
+          2. 否则读 AstrBot 全局「图片转述模型」（provider_settings.
+             default_image_caption_provider_id，即用户在 AstrBot 里配的识图模型）；
+          3. 再否则试兜底提供商；
+          4. 都不行返回 None，调用方跳过带图分析，而不是对着看不懂的图硬编废话。
+
+        每步都打日志，让用户能直接从日志看出「用的哪个模型、为什么不识图、回退到哪」。
+        """
+        context = self.cfg.context
+        models = self.cfg.llm_models
+        chosen_id = self._norm_provider_id(getattr(models, site_key, ""))
+        fallback_id = self._norm_provider_id(models.fallback)
+
+        primary = self._resolve_llm(site_key)
+        if self._provider_supports_image(primary):
+            return primary
+
+        # 自选模型不识图（或没选、落到了系统默认但不识图）：找 AstrBot 的识图模型
+        caption_id = ""
+        try:
+            caption_id = str(
+                context.get_config().get("provider_settings", {}).get(
+                    "default_image_caption_provider_id", ""
+                ) or ""
+            ).strip()
+        except Exception as e:
+            logger.debug(f"[资料卡] 读取 AstrBot 图片转述模型配置失败: {e}")
+        caption_provider = None
+        if caption_id:
+            caption_provider = context.get_provider_by_id(caption_id)
+            if caption_provider and not self._provider_supports_image(caption_provider):
+                logger.warning(
+                    f"[资料卡] AstrBot 图片转述模型 {caption_id} 未声明图像能力，跳过回退"
+                )
+                caption_provider = None
+
+        if caption_provider and hasattr(caption_provider, "text_chat"):
+            logger.info(
+                f"[资料卡] {site_key} 所选模型不支持识图，已自动改用 AstrBot 图片转述模型 "
+                f"{caption_id}。若仍输出「没设置头像」，请确认该模型支持识图。"
+            )
+            return caption_provider
+
+        # 兜底提供商若能识图也可以用
+        if fallback_id and fallback_id not in (chosen_id, caption_id):
+            fb = context.get_provider_by_id(fallback_id)
+            if fb and self._provider_supports_image(fb) and hasattr(fb, "text_chat"):
+                logger.info(f"[资料卡] {site_key} 所选模型不支持识图，已改用兜底提供商 {fallback_id}")
+                return fb
+
+        logger.warning(
+            f"[资料卡] {site_key} 需要识图，但所选提供商与 AstrBot 图片转述模型都不支持图像输入"
+            "（或未配置）。请在「模型配置」为该功能选一个视觉模型（modalities 含 image，"
+            "如 Gemini / GPT-4o / Qwen-VL），或在 AstrBot「图片转述模型」里配一个识图模型。"
+            "本次跳过该项分析，避免出现「没设置头像」这类误判。"
+        )
+        return None
+
     async def _build_welcome(self, result: BoxResult) -> str:
         """Fill the welcome text for a join card (rendered inside the card).
 
@@ -884,7 +970,7 @@ class BoxService:
         specs: list[tuple[str, Any, tuple[str, bool]]] = []
         if ai.avatar_analysis and avatar_ok:
             specs.append(
-                ("avatar", self._resolve_llm("avatar"),
+                ("avatar", self._resolve_vision_llm("avatar"),
                  ("这是一位QQ用户的头像图片。请根据头像画面，用轻松幽默的语气写一句话点评这位用户，"
                   "不超过40个字。直接输出点评内容，不要任何前缀、引号或解释。"
                   "特别地：如果这张头像是QQ默认头像、纯色或一片空白，请只写"
@@ -905,7 +991,7 @@ class BoxService:
                 "昵称：未设置\n" if nickname_missing else f"昵称：{profile.nickname}\n"
             )
             specs.append(
-                ("overall", self._resolve_llm("overall"),
+                ("overall", self._resolve_vision_llm("overall"),
                  ("这是一位QQ用户的头像图片和公开资料：\n"
                   f"{nickname_line}QQ号：{target_id}\n{profile_text}\n"
                   "请综合以上信息，用轻松幽默的语气写一句话锐评这位用户，不超过50个字。"
