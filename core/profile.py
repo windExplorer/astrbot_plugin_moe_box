@@ -183,23 +183,6 @@ def parse_epoch(value: Any) -> int:
         return 0
 
 
-def reg_days_from(reg_time: Any, now: datetime | None = None) -> int | None:
-    """根据注册真值算「注册至今整天数」；无真值/时间非法返回 None。
-
-    只有适配器给了秒级注册时间戳时才算得出天数，估算的年份区间不算。
-    """
-    ts = parse_epoch(reg_time)
-    if not ts:
-        return None
-    try:
-        current = (now or datetime.now()).timestamp()
-        if current <= ts:
-            return None
-        return int((current - ts) // 86400)
-    except (OSError, ValueError, OverflowError):
-        return None
-
-
 def normalize_sex(value: Any) -> str:
     """归一化性别的各种写法；字段缺失（None/空）返回 ""。
 
@@ -398,7 +381,6 @@ class BoxUserProfile:
         "last_sent": "最后发言",
         "qqLevel": "QQ等级",
         "reg_time": "注册时间",
-        "reg_days": "注册天数",
         "avatar_time": "头像修改时间",
         "login_days": "登录天数",
         "isHideQQLevel": "隐藏QQ等级",
@@ -452,7 +434,6 @@ class BoxUserProfile:
     qq_level: Any = None
     reg_time: Any = None
     reg_time_precise: bool = False
-    reg_days: Any = None
     avatar_time: Any = None
     login_days: Any = None
     hide_qq_level: bool = False
@@ -505,10 +486,8 @@ class BoxUserProfile:
             # QQ 的年龄本来就是从生日算出来的；接口没给年龄时自己算
             age = age_from_birthday(birth_year, birth_month, birth_day) or None
 
-        # 注册时间真值：协议端给了秒级时间戳才算天数（估算年份区间不算）
+        # 注册时间真值：协议端给了秒级时间戳就显示到时分秒（月日不可靠，见 reg_time_text）
         reg_time, reg_time_precise = cls._pick_reg_time(stranger, member, library)
-        # 只有秒级真值才算天数；日期文本被 parse_epoch 补成年初，不算，避免假精度
-        reg_days = reg_days_from(reg_time) if reg_time_precise else None
         # 头像修改时间：OneBot 标准无此字段，ICQQ/OIDB 扩展给了才显示
         avatar_time = cls._pick_avatar_time(stranger, member, library)
 
@@ -549,7 +528,6 @@ class BoxUserProfile:
             qq_level=cls._pick_qq_level(stranger),
             reg_time=reg_time,
             reg_time_precise=reg_time_precise,
-            reg_days=reg_days,
             avatar_time=avatar_time,
             login_days=stranger.get("login_days"),
             hide_qq_level=bool(stranger.get("isHideQQLevel")),
@@ -591,9 +569,9 @@ class BoxUserProfile:
 
         适配器（NapCat / SnowLuma / ICQQ-OIDB 等）与资料库接口的字段名不统一，
         逐个试。仅当原始值是**数字时间戳**（秒/毫秒）时 ``precise=True``，这时
-        卡片显示到时分秒、并可算注册天数；日期文本（如 ``2008-06-01``）只取年份，
-        标成 ``False``，避免把补出来的 1 月 1 日 0 点当真值显示。都没有则返回
-        ``(None, False)``，届时退回「按 QQ 号号段估算」（见 reg_time_text）。
+        卡片显示「年份+时分秒」（协议端补的月日不可靠，不显示）；日期文本
+        （如 ``2008-06-01``）只取年份，标成 ``False``。都没有则返回 ``(None, False)``，
+        届时退回「按 QQ 号号段估算」（见 reg_time_text）。
         """
         for source in sources:
             if not isinstance(source, dict):
@@ -725,9 +703,12 @@ class BoxUserProfile:
             ts = parse_epoch(self.reg_time)
             if ts:
                 try:
-                    # 秒级时间戳真值：显示到时分秒（用户要的「真实时间」）；
-                    # 日期文本补出来的 ts 只显示年份，绝不伪造月日时分秒。
-                    fmt = "%Y-%m-%d %H:%M:%S" if self.reg_time_precise else "%Y年"
+                    # 秒级时间戳真值：年份与时分秒都可信，但协议端（SnowLuma 等）
+                    # 往往只给「注册年份 + 时刻」，把月日补成 01-01——若照原样显示
+                    # 就是清一色「X 月 01 日」，看着像精确真值其实是假的。因此真值
+                    # 显示为「YYYY年 HH:MM:SS」：保留可靠的年和时分秒，不显示假月日。
+                    # 日期文本补出来的 ts 只显示年份，绝不伪造时刻。
+                    fmt = "%Y年 %H:%M:%S" if self.reg_time_precise else "%Y年"
                     return datetime.fromtimestamp(ts).strftime(fmt)
                 except (ValueError, OSError, OverflowError):
                     pass
@@ -896,11 +877,6 @@ class BoxUserProfile:
             case "reg_time":
                 text = self.reg_time_text
                 return [f"{label}：{text}"] if text else []
-            case "reg_days":
-                days = _to_int(self.reg_days)
-                if days and days > 0:
-                    return [f"{label}：{days}天（约 {days / 365.2425:.1f} 年）"]
-                return []
             case "avatar_time":
                 if self.avatar_time is None:
                     return []

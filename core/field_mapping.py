@@ -115,13 +115,7 @@ FIELD_MAPPING: list[dict[str, Any]] = [
     {
         "key": "reg_time",
         "label": "注册时间",
-        # 真值来自适配器扩展字段（秒级时间戳显示到时分秒）；拿不到时按 QQ 号号段估算
-        "source": "computed",
-    },
-    {
-        "key": "reg_days",
-        "label": "注册天数",
-        # 仅有秒级注册时间真值时才算得出，否则整行省略
+        # 真值来自适配器扩展字段（年份+时分秒可信；协议端补的月日不显示）；拿不到按号段估算
         "source": "computed",
     },
     {

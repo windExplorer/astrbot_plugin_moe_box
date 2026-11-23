@@ -32,7 +32,8 @@ from pathlib import Path
 #   1 = v0.12.24（卡头昵称独占一行、等级独立行）
 #   2 = v0.12.25（空昵称显示「未设置昵称」占位，不再用 QQ 号顶替）
 #   3 = v0.12.29（注册时间真值显示到时分秒 + 新增注册天数/头像修改时间字段）
-CARD_LAYOUT_VERSION = 3
+#   4 = v0.12.32（注册时间真值改为「年份+时分秒」去掉假月日；移除注册天数字段）
+CARD_LAYOUT_VERSION = 4
 
 import json
 import sqlite3
