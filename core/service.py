@@ -216,14 +216,18 @@ class BoxService:
         """
         display_options = list(self.cfg.display_options)
         # 注册时间由独立开关控制（已从「信息显示选项」列表里摘出来，免得两个入口打架）：
-        # 开着就注入，关着就把残留项一并剔掉——开关必须是说了算的那一个
+        # 开着就注入，关着就把残留项一并剔掉——开关必须是说了算的那一个。
+        # 注册天数是注册时间的附属信息，一并跟随此开关（不塞进 display_options——
+        # 老用户配置里没有这个新选项，靠默认勾选不会自动生效，会导致「拿到真值却
+        # 看不到天数」）。头像修改时间等非附属字段仍走 display_options。
+        _reg_keys = ("reg_time", "注册时间", "reg_days", "注册天数")
         if self.cfg.show_reg_time:
             if "reg_time" not in display_options and "注册时间" not in display_options:
                 display_options.append("reg_time")
+            if "reg_days" not in display_options and "注册天数" not in display_options:
+                display_options.append("reg_days")
         else:
-            display_options = [
-                opt for opt in display_options if opt not in ("reg_time", "注册时间")
-            ]
+            display_options = [opt for opt in display_options if opt not in _reg_keys]
         if card_type == "join":
             # 新朋友卡（入群卡）固定补上性别/生日/年龄：这是新人的第一印象卡，
             # 且这三项最依赖「陌生人与成员两个接口」的数据，见 _join_card_extras

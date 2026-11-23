@@ -31,7 +31,8 @@ from pathlib import Path
 # 会被继续缓存命中，用户看到的还是老样子。
 #   1 = v0.12.24（卡头昵称独占一行、等级独立行）
 #   2 = v0.12.25（空昵称显示「未设置昵称」占位，不再用 QQ 号顶替）
-CARD_LAYOUT_VERSION = 2
+#   3 = v0.12.29（注册时间真值显示到时分秒 + 新增注册天数/头像修改时间字段）
+CARD_LAYOUT_VERSION = 3
 
 import json
 import sqlite3
