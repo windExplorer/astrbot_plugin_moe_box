@@ -1,5 +1,24 @@
 # 更新日志
 
+## v0.12.33
+
+反馈 + 截图：WebUI 模型页「头像分析」下拉选的是 `modelscope · deepseek-ai/DeepSeek-V4.1-Flash-1017`，**保存后配置里只剩 `modelscope`**，于是头像点评根本没用到所选模型（日志：`Provider modelscope was not found` → 回退系统默认 agnes，返回「没设置头像」）。
+
+根因（真 bug，本次修复）：`_norm_provider_id()` 里有 `value.split("/", 1)[0]`，本意是容错旧版「provider/model」写法，但 AstrBot 的 provider ID **本身就允许带斜杠**（如 `modelscope/deepseek-ai/DeepSeek-V4.1-Flash-1017`）。WebUI 下拉 value 就是这个完整 ID，保存时被这行砍成前缀 `modelscope`——`get_provider_by_id("modelscope")` 自然找不到，静默回退系统默认。用户以为配好了，其实一直在用别的模型，头像分析当然不对。
+
+修复（`core/service.py` + `core/webui_api.py` + 面板前端）：
+
+- **`_norm_provider_id()` 不再截断**：原样保留完整 ID（只去首尾空格）。AstrBot provider id 由用户自定义，可含斜杠，不能自作主张砍。
+- **新增 `_find_provider()`**：完整 ID 优先匹配；找不到时按前缀/后缀兜底（旧配置里残留的 `modelscope` 仍能找到 `modelscope/deepseek-ai/...`），兼容历史被截断的配置。`_resolve_llm()` 与 `_resolve_vision_llm()` 的 caption/fallback 三处查找全部改用它。
+- **旧配置自愈**：`get_model_selection()`（WebUI 打开模型页时调用）若发现存的是被截断的半截 ID，用 `_resolve_full_provider_id()` 还原成完整 ID 并落盘——用户下次打开面板看到的就是对的、也能真正生效。
+- **失效可见**：`/llm/models` 返回 `selection_valid`（每项已选 ID 是否仍有效）与 `available_ids`；面板「模型」页在失效时显示橙色告警「以下功能配置的模型已失效…请重新选择并保存」，并在对应下拉 label 标「（已失效）」。以前失效是静默回退，现在一眼可见。
+- **日志可诊断**：`_provider_label()` 以前把 `meta()` 返回的 `ProviderMeta`（dataclass）当 dict 取，导致日志里 ID 永远是 `<unknown>`；改为按属性访问，现在日志直接显示真实 `provider id · 模型名 [modalities]`。`_resolve_llm()` 找不到 provider 时也列出当前可用 ID 列表和修复指引。
+- 布局版本不变（没改卡片像素/字段，只改了模型配置链路与日志）。
+
+> 升级后请先打开面板「模型」页：如果看到失效告警，重选一次模型并保存；如果没有告警，说明配置已自愈为完整 ID。再跑一张卡，日志里 `[资料卡] AI 诊断｜[avatar] 模型=` 会显示真实的提供商 ID，确认用的就是所选模型。
+
+验证：uv 真跑 9 项断言全过——带斜杠完整 ID 原样保留、空格处理、_find_provider 完整命中与旧截断值前缀兜底、_resolve_full_provider_id 自愈、_provider_label 显示真实 ID（含 dataclass meta）；`compileall`、lint、面板模板结构守卫（v-if 的 n-alert 已移出 n-space，避免 vendored naive 的 keyed-diff DOM 重复）均通过。
+
 ## v0.12.32
 
 反馈：注册时间「都是 1 月 1 日」。定位结论：**不是插件 bug，是数据源精度问题**。用户日志里的 `reg_time: 1262348821` 解码是 `2010-01-01 20:27:01`——年份与时分秒都合理，只有月日是 01-01。插件 `parse_epoch` 对纯数字时间戳是直接 `fromtimestamp` 解码、绝不补月日；只有日期文本才提取年份补年初，而那种只显示年份。所以这是协议端（SnowLuma）从腾讯只拿到「注册年份 + 时刻」、把月日补成 01-01 组装成的时间戳。

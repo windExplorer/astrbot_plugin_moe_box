@@ -214,18 +214,21 @@
         <!-- ═══════════ 模型 ═══════════ -->
         <template v-else-if="activePage === 'models'">
           <n-card title="模型设置" size="small" style="margin-bottom:16px">
+            <n-alert v-if="invalidModelKeys.length" type="warning" :bordered="false" style="margin-bottom:14px">
+              ⚠️ 以下功能配置的模型已失效（提供商被删/改名，或旧版保存时被截断）：{{ invalidModelLabels }}。当前会回退到系统默认；请重新选择并保存。
+            </n-alert>
             <n-space vertical size="large">
               <n-text depth="3">
-                优先级：各功能自选 → 兜底模型 → 系统默认（★）。下拉可搜索；此设置与插件配置页的「模型配置」区块读写同一份数据。
+                优先级：各功能自选 → 兜底模型 → 系统默认（★）。下拉可搜索；此设置与插件配置页的「模型配置」区块读写同一份数据。下拉项显示「提供商 · 模型」，选中保存的是完整提供商 ID。
               </n-text>
               <n-grid :cols="2" :x-gap="14" :y-gap="14">
                 <n-gi v-for="s in modelSelects" :key="s.key">
-                  <div class="field-label">{{ s.label }}</div>
+                  <div class="field-label">{{ s.label }} <span v-if="selectionValid[s.key] === false && selection[s.key]" style="color:#e8802a">（已失效）</span></div>
                   <n-select v-model:value="selection[s.key]" :options="providerOptions"
                             filterable clearable placeholder="（跟随兜底 / 系统默认）" size="small"></n-select>
                 </n-gi>
                 <n-gi>
-                  <div class="field-label">兜底模型（各功能未选择时使用）</div>
+                  <div class="field-label">兜底模型（各功能未选择时使用）<span v-if="selectionValid.fallback === false && selection.fallback" style="color:#e8802a">（已失效）</span></div>
                   <n-select v-model:value="selection.fallback" :options="providerOptions"
                             filterable clearable placeholder="（系统默认）" size="small"></n-select>
                 </n-gi>
@@ -308,6 +311,7 @@
       var llmItems = ref([]);
       var modelsLoading = ref(false);
       var selection = ref({ welcome: "", avatar: "", signature: "", overall: "", fallback: "" });
+      var selectionValid = ref({});
       var savingModels = ref(false);
       var modelSelects = [
         { key: "welcome", label: "AI 欢迎语" },
@@ -531,11 +535,21 @@
           return { label: p.label + (p.is_default ? "（默认）" : ""), value: p.id };
         });
       });
+      var invalidModelKeys = computed(function () {
+        return Object.keys(selectionValid.value).filter(function (k) {
+          return selectionValid.value[k] === false && !!selection.value[k];
+        });
+      });
+      var invalidModelLabels = computed(function () {
+        var names = { welcome: "AI 欢迎语", avatar: "头像分析", signature: "签名解读", overall: "综合锐评", fallback: "兜底模型" };
+        return invalidModelKeys.value.map(function (k) { return names[k] || k; }).join("、");
+      });
 
       function loadModels() {
         modelsLoading.value = true;
         return bridge.apiGet("llm/models", { _t: Date.now() }).then(function (d) {
           llmItems.value = d.items || [];
+          selectionValid.value = d.selection_valid || {};
           selection.value = Object.assign(
             { welcome: "", avatar: "", signature: "", overall: "", fallback: "" },
             d.selection || {}
@@ -803,6 +817,7 @@
         llmItems: llmItems, modelsLoading: modelsLoading,
         selection: selection, modelSelects: modelSelects, savingModels: savingModels,
         providerOptions: providerOptions, saveModels: saveModels, loadModels: loadModels,
+        selectionValid: selectionValid, invalidModelKeys: invalidModelKeys, invalidModelLabels: invalidModelLabels,
         configSections: CONFIG_SECTIONS, configData: configData,
         cfgGet: cfgGet, cfgSet: cfgSet, saveSection: saveSection, savingSection: savingSection,
         toChoices: toChoices,

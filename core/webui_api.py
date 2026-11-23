@@ -509,11 +509,23 @@ def register_apis(plugin, backfiller: MemberBackfiller, refresher: GroupRefreshe
         except Exception as e:
             logger.warning(f"[资料卡] 读取提供商列表失败: {e}")
         items.sort(key=lambda it: (not it["is_default"], it["label"]))
+        selection = plugin.box.get_model_selection()
+        # 标注每个已选 ID 是否仍有效：失效的（provider 被删/改名/被旧版截断）
+        # 前端要醒目提示，避免用户以为配好了、实际一直回退系统默认。
+        available_ids = {it["id"] for it in items}
+        valid: dict[str, bool] = {}
+        for key, pid in selection.items():
+            if not pid:
+                valid[key] = True  # 未选 = 跟随兜底/系统默认，合法
+                continue
+            valid[key] = pid in available_ids
         return _ok(
             {
                 "items": items,
                 "default_id": default_id,
-                "selection": plugin.box.get_model_selection(),
+                "selection": selection,
+                "selection_valid": valid,
+                "available_ids": sorted(available_ids),
             }
         )
 

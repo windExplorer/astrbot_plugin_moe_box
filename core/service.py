@@ -620,13 +620,85 @@ class BoxService:
 
     @staticmethod
     def _norm_provider_id(value: Any) -> str:
-        """规范化为提供商 ID：容错处理旧版「提供商/模型名」格式，取斜杠前的部分。"""
-        v = str(value or "").strip()
-        return v.split("/", 1)[0].strip() if v else ""
+        """规范化为提供商 ID：**保留完整值**（AstrBot 的 provider ID 本身可含斜杠）。
+
+        历史 bug（v0.12.32 及以前）：这里 ``split("/", 1)[0]`` 把
+        ``modelscope/deepseek-ai/DeepSeek-V4.1-Flash-1017`` 砍成 ``modelscope``，
+        保存后配置里只剩前缀，``get_provider_by_id`` 找不到 → 静默回退系统默认，
+        表现就是「WebUI 明明选了模型、头像点评却不是那个模型」。
+
+        AstrBot 的 provider ``id`` 由用户自定义，可以是 ``xxx`` 也可以是
+        ``source/model`` 这种带斜杠的形式；WebUI 下拉的 value 就是这个完整 id，
+        所以这里必须原样保留，绝不能截断。旧配置里残留的截断值由 ``_find_provider``
+        做前缀兜底兼容，不再在保存时破坏新值。
+        """
+        return str(value or "").strip()
+
+    def _find_provider(self, provider_id: str):
+        """按 ID 找 provider：完整 ID 优先；找不到时按前缀/后缀兜底（兼容旧版被截断的配置）。
+
+        - 完整匹配：``get_provider_by_id(provider_id)``（AstrBot inst_map 的键就是完整 id）；
+        - 前缀兜底：旧配置里存了 ``modelscope``、实际 id 是 ``modelscope/deepseek-ai/...``
+          时，取第一个以该前缀开头的可用 provider；
+        - 后缀兜底：反之亦然。
+        """
+        if not provider_id:
+            return None
+        direct = self.cfg.context.get_provider_by_id(provider_id)
+        if direct and hasattr(direct, "text_chat"):
+            return direct
+        fallback = None
+        for pid in self._available_provider_ids():
+            if pid.startswith(provider_id + "/") or pid.endswith("/" + provider_id):
+                cand = self.cfg.context.get_provider_by_id(pid)
+                if cand and hasattr(cand, "text_chat"):
+                    if fallback is None:
+                        fallback = cand
+                    if len(pid) <= len(provider_id) + 32:  # 取最短匹配，通常最贴近
+                        return cand
+        return fallback
 
     def get_model_selection(self) -> dict[str, str]:
+        """返回各功能选的 provider ID（原样保留完整值），顺手自愈旧版被截断的配置。
+
+        v0.12.32 及以前 ``_norm_provider_id`` 会把带斜杠的 ID 砍成前缀并写盘，
+        旧配置里可能残留 ``modelscope`` 这种半截值。这里若能按前缀找到完整 ID，
+        就回填成完整值并落盘——用户下次打开面板看到的就是对的、也能真正生效。
+        """
         m = self.cfg.llm_models
-        return {k: self._norm_provider_id(getattr(m, k, "")) for k in self.MODEL_KEYS}
+        changed = False
+        out: dict[str, str] = {}
+        for k in self.MODEL_KEYS:
+            pid = self._norm_provider_id(getattr(m, k, ""))
+            if not pid:
+                out[k] = ""
+                continue
+            full = self._resolve_full_provider_id(pid)
+            if full and full != pid:
+                setattr(m, k, full)
+                changed = True
+                out[k] = full
+            else:
+                out[k] = pid
+        if changed:
+            try:
+                self.cfg.save_config()
+                logger.info(f"[资料卡] 已自愈被截断的模型配置: {out}")
+            except Exception as e:
+                logger.warning(f"[资料卡] 自愈模型配置落盘失败: {e}")
+        return out
+
+    def _resolve_full_provider_id(self, provider_id: str) -> str:
+        """把可能截断的 provider id 还原成当前可用的完整 id；找不到返回原值。"""
+        if not provider_id:
+            return provider_id
+        ids = self._available_provider_ids()
+        if provider_id in ids:
+            return provider_id
+        matches = [p for p in ids if p.startswith(provider_id + "/") or p.endswith("/" + provider_id)]
+        if matches:
+            return min(matches, key=len)
+        return provider_id
 
     def set_model_selection(self, selection: dict[str, str]) -> None:
         m = self.cfg.llm_models
@@ -645,10 +717,16 @@ class BoxService:
         provider_id = self._norm_provider_id(getattr(models, site_key, "")) or self._norm_provider_id(models.fallback)
         if not provider_id:
             return context.get_using_provider()
-        provider = context.get_provider_by_id(provider_id)
+        provider = self._find_provider(provider_id)
         if provider and hasattr(provider, "text_chat"):
             return provider
-        logger.warning(f"[资料卡] 未找到 LLM 提供商 {provider_id}，回退系统默认")
+        # 配置里存了失效 ID（provider 被删/改名）：明确告警并列出当前可用 ID，
+        # 否则用户以为自己配好了、实际一直在用系统默认，头像分析自然不对。
+        logger.warning(
+            f"[资料卡] 未找到 LLM 提供商 {provider_id}（{site_key} 所选），本次回退系统默认。"
+            f"当前可用提供商 ID：{self._available_provider_ids() or '（无）'}。"
+            "请到插件面板「模型」页重选一个有效模型并保存。"
+        )
         return context.get_using_provider()
 
     @staticmethod
@@ -712,7 +790,7 @@ class BoxService:
             logger.debug(f"[资料卡] 读取 AstrBot 图片转述模型配置失败: {e}")
         caption_provider = None
         if caption_id:
-            caption_provider = context.get_provider_by_id(caption_id)
+            caption_provider = self._find_provider(caption_id)
             if caption_provider and not self._provider_supports_image(caption_provider):
                 logger.warning(
                     f"[资料卡] AstrBot 图片转述模型 {caption_id} 未声明图像能力，跳过回退"
@@ -728,7 +806,7 @@ class BoxService:
 
         # 兜底提供商若能识图也可以用
         if fallback_id and fallback_id not in (chosen_id, caption_id):
-            fb = context.get_provider_by_id(fallback_id)
+            fb = self._find_provider(fallback_id)
             if fb and self._provider_supports_image(fb) and hasattr(fb, "text_chat"):
                 logger.info(f"[资料卡] {site_key} 所选模型不支持识图，已改用兜底提供商 {fallback_id}")
                 return fb
@@ -938,24 +1016,57 @@ class BoxService:
 
     @staticmethod
     def _provider_label(provider: Any) -> str:
-        """日志里用的模型身份串：提供商 ID / 模型名 / 声明的模态，一眼看清在用什么。"""
+        """日志里用的模型身份串：提供商 ID / 模型名 / 声明的模态，一眼看清在用什么。
+
+        ``meta()`` 返回的是 ``ProviderMeta`` dataclass（不是 dict），必须按属性取；
+        以前误用 dict 取值导致 ID 一直显示 <unknown>，看不出实际用的哪个提供商。
+        """
         if provider is None:
             return "<无>"
-        meta = {}
+        pid = ""
+        model = ""
         try:
             m = provider.meta()
             if isinstance(m, dict):
-                meta = m
+                pid = str(m.get("id") or "")
+                model = str(m.get("model") or "")
+            else:  # ProviderMeta dataclass
+                pid = str(getattr(m, "id", "") or "")
+                model = str(getattr(m, "model", "") or "")
         except Exception:
             pass
-        pid = meta.get("id") or getattr(provider, "provider_id", "") or ""
-        model = (getattr(provider, "model_name", "") or meta.get("model", "") or "")
+        if not pid:
+            pid = str(
+                (getattr(provider, "provider_config", {}) or {}).get("id")
+                or getattr(provider, "provider_id", "")
+                or ""
+            )
+        if not model:
+            try:
+                model = str(provider.get_model() or "")
+            except Exception:
+                model = ""
+            model = model or str(getattr(provider, "model_name", "") or "")
         try:
             modalities = (getattr(provider, "provider_config", None) or {}).get("modalities")
         except Exception:
             modalities = None
         mod = ",".join(str(x) for x in modalities) if modalities else "未声明(按全支持)"
-        return f"{pid or '<unknown>'}/{model or '<unknown>'} [modalities={mod}]"
+        return f"{pid or '<unknown>'} · {model or '<unknown>'} [modalities={mod}]"
+
+    def _available_provider_ids(self) -> list[str]:
+        """当前 AstrBot 已加载、且可做文本对话的提供商 ID（WebUI 下拉同源）。"""
+        out: list[str] = []
+        try:
+            for p in self.cfg.context.get_all_providers() or []:
+                if not hasattr(p, "text_chat"):
+                    continue
+                pid = str(((getattr(p, "provider_config", None) or {}).get("id")) or "")
+                if pid:
+                    out.append(pid)
+        except Exception:
+            pass
+        return sorted(set(out))
 
     async def _get_analyses(
         self,
