@@ -278,7 +278,14 @@ class BoxPlugin(Star):
                 if is_enter:
                     self.box.store.record_join(group_id, user_id, now)
                 else:
-                    self.box.store.record_leave(group_id, user_id, now)
+                    # 主动退群与被踢都记进逐次历史，卡片展示的仍是入群次数
+                    self.box.store.record_leave(
+                        group_id,
+                        user_id,
+                        now,
+                        event_type="kick" if is_kick else "leave",
+                        operator_id=str(raw.get("operator_id") or "") if is_kick else "",
+                    )
             except Exception as e:
                 logger.warning(f"[资料卡] 记录入退群时间失败: {e}")
 

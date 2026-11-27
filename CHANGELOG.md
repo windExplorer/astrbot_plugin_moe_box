@@ -1,5 +1,18 @@
 # 更新日志
 
+## v0.12.34
+
+需求：成员每次入群、退群的时间都要留下来，卡片上再加一栏「入群次数」——只有 1 次不占行，大于 1 才展示。新增字段时老数据没有值，所以默认一律按 1 次算，之后每真正观测到一次新的入群事件才累加；退群/被踢同样逐次记录，但展示的仍是入群次数（不会把退群算进去）。
+
+改动：
+
+- `core/store.py`：新增 `member_events` 表（每次 join / leave / kick 一行，含精确到秒的时间、被踢时还记 operator_id）与索引；`member_times` 加 `join_count INTEGER NOT NULL DEFAULT 1`，老库由 `_ensure_columns()` 自动 `ALTER TABLE` 补列，历史行天然是 1 次。
+- `record_join()` 首次插入为 1、`ON CONFLICT` 时 `join_count + 1`，同时覆盖入群时间并清空退群时间；`record_leave()` 只更新最后一次离开时间并写历史，次数不动。回填用的 `ensure_join()` / `ensure_join_many()` 走 `DO NOTHING` / 空值条件，不会把次数算多。
+- `core/service.py`：所有卡片类型（普通查询 / 入群 / 退群 / 被踢）统一读取本地次数，`>1` 时追加 `入群次数：N次`；`core/draw.py` 把该标签注册成独立行标签，避免被当成上一行的续行。`CARD_LAYOUT_VERSION` 4 → 5，老图缓存立即失效；再次入群时还会删掉该成员冷却期内缓存的旧卡，不必等冷却结束。
+- `main.py`：退群与被踢调用 `record_leave()` 时传入 `event_type` 和操作管理员，历史表能区分两种离开方式。
+
+验证：真跑全部断言通过——首次入群=1、退群不加、再次入群=2、退群时间清空、历史顺序含 leave/kick 与 operator、回填不重复计数、重入群作废旧缓存、老版本库补列后默认 1 再 +1、`>1` 显示守卫与行标签解析；`compileall` 与 lint 均通过。
+
 ## v0.12.33
 
 反馈 + 截图：WebUI 模型页「头像分析」下拉选的是 `modelscope · deepseek-ai/DeepSeek-V4.1-Flash-1017`，**保存后配置里只剩 `modelscope`**，于是头像点评根本没用到所选模型（日志：`Provider modelscope was not found` → 回退系统默认 agnes，返回「没设置头像」）。

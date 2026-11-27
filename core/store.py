@@ -19,6 +19,12 @@ setting (avatar shape, desensitize, display options, AI switches...).
 (one row per member, replaced wholesale on every live member-list fetch). It is
 what the panel's coverage numbers are measured against, so records of people
 who left without their notice ever being observed do not inflate the counts.
+
+``member_events`` keeps every observed join/leave/kick as a separate row (the
+``member_times`` row only keeps the latest pair). ``join_count`` on that row
+starts at 1 — also for rows created before this field existed — and is
+incremented by each further join notice; only join events move it, leave events
+are recorded in the history but do not change the displayed count.
 """
 
 import json
@@ -33,7 +39,8 @@ from pathlib import Path
 #   2 = v0.12.25（空昵称显示「未设置昵称」占位，不再用 QQ 号顶替）
 #   3 = v0.12.29（注册时间真值显示到时分秒 + 新增注册天数/头像修改时间字段）
 #   4 = v0.12.32（注册时间真值改为「年份+时分秒」去掉假月日；移除注册天数字段）
-CARD_LAYOUT_VERSION = 4
+#   5 = v0.12.34（入群次数 >1 时才展示的一栏）
+CARD_LAYOUT_VERSION = 5
 
 import json
 import sqlite3
@@ -47,8 +54,19 @@ CREATE TABLE IF NOT EXISTS member_times (
     user_id  TEXT NOT NULL,
     join_time  TEXT NOT NULL DEFAULT '',
     leave_time TEXT NOT NULL DEFAULT '',
+    join_count INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (group_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS member_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id    TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    operator_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_member_events_target
+    ON member_events (group_id, user_id, occurred_at);
 CREATE TABLE IF NOT EXISTS card_cache (
     group_id   TEXT NOT NULL,
     user_id    TEXT NOT NULL,
@@ -108,6 +126,9 @@ class MemberStore:
         """
         wanted = {
             "card_cache": {"layout": "TEXT NOT NULL DEFAULT ''"},
+            # 老库的行在创建时还没有这个字段：DEFAULT 1 让「历史数据默认入群 1 次」，
+            # 之后每次新观测到的入群事件才 +1。
+            "member_times": {"join_count": "INTEGER NOT NULL DEFAULT 1"},
         }
         for table, columns in wanted.items():
             existing = {
@@ -128,19 +149,72 @@ class MemberStore:
             ).fetchone()
         return (row[0], row[1]) if row else None
 
+    def _record_event(
+        self,
+        group_id: str,
+        user_id: str,
+        event_type: str,
+        when: datetime,
+        operator_id: str = "",
+    ) -> None:
+        """记一条逐次事件（调用方须已持有 self._lock）。"""
+        self._conn.execute(
+            "INSERT INTO member_events (group_id, user_id, event_type, occurred_at, operator_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (group_id, user_id, event_type, _fmt(when), operator_id),
+        )
+
+    @staticmethod
+    def _clear_card_cache(group_id: str, user_id: str, conn: sqlite3.Connection) -> None:
+        """入群次数变了就作废冷却期内的旧卡，避免继续端出没这一栏的图。"""
+        conn.execute(
+            "DELETE FROM card_cache WHERE group_id = ? AND user_id = ?", (group_id, user_id)
+        )
+
     def record_join(self, group_id: str, user_id: str, when: datetime) -> None:
-        """Precise join observed live; a rejoin overwrites and clears leave_time."""
+        """Precise join observed live; a rejoin overwrites and clears leave_time.
+
+        首次记录次数为 1（老库/回填行本来就是 1），此后每观测到一次入群 +1。
+        """
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO member_times (group_id, user_id, join_time, leave_time)
-                VALUES (?, ?, ?, '')
+                INSERT INTO member_times (group_id, user_id, join_time, leave_time, join_count)
+                VALUES (?, ?, ?, '', 1)
                 ON CONFLICT(group_id, user_id)
-                DO UPDATE SET join_time = excluded.join_time, leave_time = ''
+                DO UPDATE SET join_time = excluded.join_time,
+                              leave_time = '',
+                              join_count = member_times.join_count + 1
                 """,
                 (group_id, user_id, _fmt(when)),
             )
+            self._record_event(group_id, user_id, "join", when)
+            self._clear_card_cache(group_id, user_id, self._conn)
             self._conn.commit()
+
+    def get_join_count(self, group_id: str, user_id: str) -> int:
+        """本地记录的入群次数；没有记录或老库空值都按 1 处理。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT join_count FROM member_times WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            ).fetchone()
+        try:
+            return max(1, int(row[0])) if row and row[0] is not None else 1
+        except (TypeError, ValueError):
+            return 1
+
+    def events_for(self, group_id: str, user_id: str, limit: int = 100) -> list[dict]:
+        """按时间倒序返回每次入群/退群/被踢的本地记录（供核对历史）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT event_type, occurred_at, operator_id FROM member_events "
+                "WHERE group_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
+                (group_id, user_id, max(1, int(limit))),
+            ).fetchall()
+        return [
+            {"event_type": r[0], "time": r[1], "operator_id": r[2]} for r in rows
+        ]
 
     def ensure_join(self, group_id: str, user_id: str, when: datetime) -> None:
         """Backfill join time from the API; an existing (event-precise) value wins."""
@@ -155,16 +229,27 @@ class MemberStore:
             )
             self._conn.commit()
 
-    def record_leave(self, group_id: str, user_id: str, when: datetime) -> None:
+    def record_leave(
+        self,
+        group_id: str,
+        user_id: str,
+        when: datetime,
+        event_type: str = "leave",
+        operator_id: str = "",
+    ) -> None:
+        """退群/被踢只更新最后一次离开时间并记历史，不改入群次数。"""
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO member_times (group_id, user_id, join_time, leave_time)
-                VALUES (?, ?, '', ?)
+                INSERT INTO member_times (group_id, user_id, join_time, leave_time, join_count)
+                VALUES (?, ?, '', ?, 1)
                 ON CONFLICT(group_id, user_id)
                 DO UPDATE SET leave_time = excluded.leave_time
                 """,
                 (group_id, user_id, _fmt(when)),
+            )
+            self._record_event(
+                group_id, user_id, "kick" if event_type == "kick" else "leave", when, operator_id
             )
             self._conn.commit()
 

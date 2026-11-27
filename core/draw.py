@@ -372,7 +372,9 @@ class CardMaker:
                 x += font.getlength(run)
 
     # ------------------------------------------------------------ rows
-    _EXTRA_LABELS = frozenset({"退群时间", "被踢时间", "在群时长", "操作管理员"})  # service-appended rows outside FIELD_LABELS
+    _EXTRA_LABELS = frozenset(  # service-appended rows outside FIELD_LABELS
+        {"退群时间", "被踢时间", "在群时长", "操作管理员", "入群次数"}
+    )
 
     @staticmethod
     def _parse_rows(lines: list[str]) -> list[list]:

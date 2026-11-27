@@ -314,6 +314,7 @@ class BoxService:
         force_times = card_type in ("leave", "kick")
         db_join = ""
         db_leave = ""
+        db_join_count = 1
         if group_id and self.cfg.record_join_leave:
             try:
                 if member_info:
@@ -335,6 +336,7 @@ class BoxService:
                 record = self.store.get(group_id, target_id)
                 if record:
                     db_join, db_leave = record
+                db_join_count = self.store.get_join_count(group_id, target_id)
             except Exception as e:
                 logger.warning(f"[资料卡] 读取本地时间库失败: {e}")
 
@@ -389,6 +391,10 @@ class BoxService:
                     display.append(f"加群时间：{db_join}")
             if db_leave and not member_info:
                 display.append(f"退群时间：{db_leave}")
+        # 入群次数：老数据默认 1 次不占行；只有真的观测到再次入群才展示。
+        # 退群/被踢卡同样展示（此时次数停在最后一次入群的值）。
+        if db_join_count > 1:
+            display.append(f"入群次数：{db_join_count}次")
         if card_type == "kick" and operator_id:
             operator_name = ""
             try:
